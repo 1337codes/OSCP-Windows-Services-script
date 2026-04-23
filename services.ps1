@@ -1,3 +1,46 @@
+param([switch]$NoColor)
+
+# --- Output coloring ------------------------------------------------------
+# Colors use Write-Host which does not emit to the pipeline. If you need to
+# capture to a file, run:  .\services.ps1 -NoColor > out.txt
+$script:UseColor = -not $NoColor
+
+function Write-Colored {
+    param([string]$Text, [string]$Color = 'Gray')
+    if ($script:UseColor) { Write-Host $Text -ForegroundColor $Color }
+    else                  { Write-Output $Text }
+}
+function Write-Blank    { if ($script:UseColor) { Write-Host '' } else { Write-Output '' } }
+function Write-Header   { param([string]$t) Write-Colored $t 'Cyan' }
+function Write-Rule     { param([string]$t) Write-Colored $t 'DarkGray' }
+function Write-Info     { param([string]$t) Write-Colored $t 'Gray' }
+function Write-Plain    { param([string]$t) Write-Colored $t 'White' }
+function Write-Good     { param([string]$t) Write-Colored $t 'Green' }
+function Write-Warn     { param([string]$t) Write-Colored $t 'Yellow' }
+function Write-Miss     { param([string]$t) Write-Colored $t 'DarkGray' }
+function Write-Bad      { param([string]$t) Write-Colored $t 'Red' }
+
+function Write-Status {
+    param([string]$t)
+    if     ($t -match '^\[\+\]') { Write-Good $t }
+    elseif ($t -match '^\[\-\]') { Write-Miss $t }
+    elseif ($t -match '^\[\!\]') { Write-Warn $t }
+    else                         { Write-Plain $t }
+}
+
+function Write-ColoredTable {
+    param([string]$Text, [scriptblock]$Colorizer)
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line.Length -eq 0) { Write-Blank; continue }
+        $color = & $Colorizer $line
+        Write-Colored $line $color
+    }
+}
+
+# Regex fragment matching ACL identities that typically indicate a
+# low-privileged user can modify the target (exploit-path indicator).
+$script:WritableAclRegex = '(Authenticated Users|\bEveryone\b|BUILTIN\\Users(?!\s*\(RX\))|\bINTERACTIVE\b)'
+
 function Get-SystemRootPath {
     if ($env:SystemRoot) { return $env:SystemRoot }
     if ($env:windir) { return $env:windir }
@@ -791,16 +834,17 @@ $currentUserSid = $currentIdentity.User.Value
 $tokenPrincipals = @(Get-CurrentTokenPrincipals)
 $allServices = @(Get-ServiceInventory)
 
-Write-Output 'Combined local pentest triage'
-Write-Output '-----------------------------'
-Write-Output ("Current user: {0}" -f $currentUser)
-Write-Output 'Sections included:'
-Write-Output '- Services / software'
-Write-Output '- Installed software'
-Write-Output '- Unquoted service paths'
-Write-Output '- DLL hijack candidates'
-Write-Output '- Scheduled tasks'
-Write-Output ''
+Write-Header 'Combined local pentest triage'
+Write-Rule   '-----------------------------'
+Write-Plain  ("Current user: {0}" -f $currentUser)
+Write-Info   'Sections included:'
+Write-Info   '- Services / software'
+Write-Info   '- Installed software'
+Write-Info   '- Unquoted service paths'
+Write-Info   '- DLL hijack candidates'
+Write-Info   '- Scheduled tasks'
+Write-Info   '- Active network connections'
+Write-Blank
 
 # Services / software
 $serviceRows = [System.Collections.Generic.List[object]]::new()
@@ -858,36 +902,77 @@ foreach ($svc in $allServices) {
 $serviceOut = @($serviceRows | Sort-Object @{ Expression = { if ($_.Findings -match 'bin:|dir:|svc:dacl|unquoted') { 0 } else { 1 } } }, @{ Expression = { if ($_.Findings -match 'software:interesting') { 1 } else { 0 } } }, Company, Service)
 $serviceActionable = @($serviceOut | Where-Object { $_.Findings -match 'bin:|dir:|svc:dacl|unquoted' -or ($_.Findings -match 'svc:restart' -and $_.Findings -match 'bin:|dir:|svc:dacl|unquoted') })
 
-Write-Output 'Services / software'
-Write-Output '-------------------'
-Write-Output 'Service filter: userland services/software only (driver rows are suppressed)'
-Write-Output ''
+Write-Header 'Services / software'
+Write-Rule   '-------------------'
+Write-Info   'Service filter: userland services/software only (driver rows are suppressed)'
+Write-Blank
 if ($serviceOut.Count -eq 0) {
-    Write-Output '[-] No interesting service/software rows were found.'
+    Write-Status '[-] No interesting service/software rows were found.'
 } else {
-    $serviceOut |
-    Format-Table Service, DisplayName, RunAs, Company, Product, Path, CanRestart, SvcRights, BinAccess, DirAccess, Findings -AutoSize |
-    Out-String -Width 4096
+    $flatSvc = [System.Collections.Generic.List[object]]::new()
+    foreach ($row in $serviceOut) {
+        $dispName = if ($row.DisplayName -and $row.DisplayName -ne 'False') { [string]$row.DisplayName } else { '-' }
+        if ($dispName.Length -gt 50) { $dispName = $dispName.Substring(0, 47) + '...' }
+        $runAs = if ($row.RunAs -and $row.RunAs -ne 'False') { $row.RunAs } else { '-' }
+        $path  = if ($row.Path  -and $row.Path  -ne 'False') { $row.Path  } else { '-' }
+        $bin   = if ($row.BinAccess -and $row.BinAccess -ne 'False') { $row.BinAccess } else { '-' }
+        $dir   = if ($row.DirAccess -and $row.DirAccess -ne 'False') { $row.DirAccess } else { '-' }
+        $state = 'CanRestart:{0} SvcRights:{1}' -f $row.CanRestart, $row.SvcRights
+
+        # Row A: identity
+        $flatSvc.Add([PSCustomObject]@{
+            Service          = $row.Service
+            'Name / BinACL'  = $dispName
+            'RunAs / DirACL' = $runAs
+            'Path / State'   = $path
+        })
+        # Row B: access
+        $flatSvc.Add([PSCustomObject]@{
+            Service          = ''
+            'Name / BinACL'  = $bin
+            'RunAs / DirACL' = $dir
+            'Path / State'   = $state
+        })
+    }
+    $tableText = ($flatSvc | Format-Table -AutoSize | Out-String -Width 4096)
+    Write-ColoredTable -Text $tableText -Colorizer {
+        param($line)
+        if ($line -match '^Service\s+Name / BinACL')   { return 'Cyan' }
+        if ($line -match '^-+\s+-+')                   { return 'DarkGray' }
+        # Row B (access row) starts with leading whitespace
+        if ($line -match '^\s') {
+            if ($line -match $script:WritableAclRegex) { return 'Red' }
+            return 'DarkGray'
+        }
+        return 'White'
+    }
 }
-Write-Output ("[+] {0} interesting service row(s)" -f $serviceOut.Count)
-Write-Output ("[+] {0} actionable service row(s)" -f $serviceActionable.Count)
-Write-Output ''
+Write-Status ("[+] {0} interesting service row(s)" -f $serviceOut.Count)
+Write-Status ("[+] {0} actionable service row(s)" -f $serviceActionable.Count)
+Write-Blank
 
 # Installed software
 $installedSoftware = @(Get-InstalledSoftwareInventory -TokenPrincipals $tokenPrincipals -CurrentUserSid $currentUserSid)
-Write-Output 'Installed software'
-Write-Output '------------------'
-Write-Output 'Software filter: uncommon/non-Microsoft software from uninstall data plus top-level Program Files folders'
-Write-Output ''
+Write-Header 'Installed software'
+Write-Rule   '------------------'
+Write-Info   'Software filter: uncommon/non-Microsoft software from uninstall data plus top-level Program Files folders'
+Write-Blank
 if ($installedSoftware.Count -eq 0) {
-    Write-Output '[-] No uncommon installed software rows were found.'
+    Write-Status '[-] No uncommon installed software rows were found.'
 } else {
-    $installedSoftware |
-    Format-Table Name, Publisher, Version, InstallDir, DirAccess, Source -AutoSize |
-    Out-String -Width 4096
-    Write-Output ("[+] {0} uncommon installed software row(s)" -f $installedSoftware.Count)
+    $tableText = ($installedSoftware |
+        Format-Table Name, Publisher, Version, InstallDir, DirAccess, Source -AutoSize |
+        Out-String -Width 4096)
+    Write-ColoredTable -Text $tableText -Colorizer {
+        param($line)
+        if ($line -match '^Name\s+Publisher')          { return 'Cyan' }
+        if ($line -match '^-+\s+-+')                   { return 'DarkGray' }
+        if ($line -match $script:WritableAclRegex)     { return 'Red' }
+        return 'White'
+    }
+    Write-Status ("[+] {0} uncommon installed software row(s)" -f $installedSoftware.Count)
 }
-Write-Output ''
+Write-Blank
 
 # Unquoted service paths
 $unquotedRows = [System.Collections.Generic.List[object]]::new()
@@ -918,17 +1003,24 @@ foreach ($svc in $allServices) {
         CandidateExecutables = if ($candidateDetails.Count -gt 0) { $candidateDetails -join ' | ' } else { 'False' }
     })
 }
-Write-Output 'Unquoted service paths'
-Write-Output '----------------------'
+Write-Header 'Unquoted service paths'
+Write-Rule   '----------------------'
 if ($unquotedRows.Count -eq 0) {
-    Write-Output '[-] No unquoted service paths with spaces were found.'
+    Write-Status '[-] No unquoted service paths with spaces were found.'
 } else {
-    $unquotedRows |
-    Format-Table Service, DisplayName, RawPath, ResolvedBinary, CandidateExecutables -AutoSize |
-    Out-String -Width 4096
-    Write-Output ("[+] {0} unquoted service path row(s)" -f $unquotedRows.Count)
+    $tableText = ($unquotedRows |
+        Format-Table Service, DisplayName, RawPath, ResolvedBinary, CandidateExecutables -AutoSize |
+        Out-String -Width 4096)
+    Write-ColoredTable -Text $tableText -Colorizer {
+        param($line)
+        if ($line -match '^Service\s+DisplayName')     { return 'Cyan' }
+        if ($line -match '^-+\s+-+')                   { return 'DarkGray' }
+        # Any unquoted path that matched is itself an exploit candidate
+        return 'Yellow'
+    }
+    Write-Status ("[+] {0} unquoted service path row(s)" -f $unquotedRows.Count)
 }
-Write-Output ''
+Write-Blank
 
 # DLL hijack candidates
 $dllServiceRows = [System.Collections.Generic.List[object]]::new()
@@ -947,14 +1039,21 @@ foreach ($svc in $allServices) {
     $meta = Get-BinaryMetadata $bin
     if (-not (Test-IsInterestingSoftwareService -Company $meta.Company -Product $meta.Product -Path $bin -DisplayName $svc.DisplayName -ServiceName $svc.Name -RawPath $svc.PathName -IsUserland $svc.IsUserland)) { continue }
 
+    $rightLabel = switch ($dirAccess.Right) {
+        'F'     { 'Full' }
+        'M'     { 'Modify' }
+        'W'     { 'Write' }
+        default { if ($dirAccess.Right) { [string]$dirAccess.Right } else { 'False' } }
+    }
+
     $dllServiceRows.Add([PSCustomObject]@{
-        Service        = $svc.Name
-        DisplayName    = if ($svc.DisplayName) { $svc.DisplayName } else { 'False' }
-        RunAs          = if ($svc.StartName) { $svc.StartName } else { 'False' }
-        Binary         = $bin
-        BinaryDir      = if ($parentDir) { $parentDir } else { 'False' }
-        DirAccess      = $dirAccess.Detail
-        WhyInteresting = 'Writable binary directory; common DLL planting / hijack prerequisite'
+        Service     = $svc.Name
+        DisplayName = if ($svc.DisplayName) { $svc.DisplayName } else { 'False' }
+        RunAs       = if ($svc.StartName) { $svc.StartName } else { 'False' }
+        Binary      = $bin
+        BinaryDir   = if ($parentDir) { $parentDir } else { 'False' }
+        DirAccess   = $dirAccess.Detail
+        Rights      = $rightLabel
     })
 }
 
@@ -964,32 +1063,51 @@ foreach ($dir in (@($machinePath -split ';' | Where-Object { $_ } | Select-Objec
     $expandedDir = [Environment]::ExpandEnvironmentVariables($dir)
     $dirAccess = Get-EffectivePathAccess -TargetPath $expandedDir -TokenPrincipals $tokenPrincipals -CurrentUserSid $currentUserSid
     if (-not $dirAccess.CanChange) { continue }
+    $pathRightLabel = switch ($dirAccess.Right) {
+        'F'     { 'Full' }
+        'M'     { 'Modify' }
+        'W'     { 'Write' }
+        default { if ($dirAccess.Right) { [string]$dirAccess.Right } else { 'False' } }
+    }
     $pathRows.Add([PSCustomObject]@{
-        PathDir        = $expandedDir
-        DirAccess      = $dirAccess.Detail
-        WhyInteresting = 'Writable machine PATH directory'
+        PathDir   = $expandedDir
+        DirAccess = $dirAccess.Detail
+        Rights    = $pathRightLabel
     })
 }
 
-Write-Output 'DLL hijack candidates'
-Write-Output '---------------------'
+Write-Header 'DLL hijack candidates'
+Write-Rule   '---------------------'
 if ($dllServiceRows.Count -eq 0) {
-    Write-Output '[-] No service-backed software with writable binary directories were found.'
+    Write-Status '[-] No service-backed software with writable binary directories were found.'
 } else {
-    $dllServiceRows |
-    Format-Table Service, DisplayName, RunAs, Binary, BinaryDir, DirAccess, WhyInteresting -AutoSize |
-    Out-String -Width 4096
-    Write-Output ("[+] {0} service row(s) with writable binary directories" -f $dllServiceRows.Count)
+    $tableText = ($dllServiceRows |
+        Format-Table Service, DisplayName, RunAs, Binary, BinaryDir, DirAccess, Rights -AutoSize |
+        Out-String -Width 4096)
+    Write-ColoredTable -Text $tableText -Colorizer {
+        param($line)
+        if ($line -match '^Service\s+DisplayName')     { return 'Cyan' }
+        if ($line -match '^-+\s+-+')                   { return 'DarkGray' }
+        # Every row here is already a finding (it passed the writable filter)
+        return 'Red'
+    }
+    Write-Status ("[+] {0} service row(s) with writable binary directories" -f $dllServiceRows.Count)
 }
 if ($pathRows.Count -eq 0) {
-    Write-Output '[-] No writable machine PATH directories were found.'
+    Write-Status '[-] No writable machine PATH directories were found.'
 } else {
-    $pathRows |
-    Format-Table PathDir, DirAccess, WhyInteresting -AutoSize |
-    Out-String -Width 4096
-    Write-Output ("[+] {0} writable machine PATH directorie(s)" -f $pathRows.Count)
+    $tableText = ($pathRows |
+        Format-Table PathDir, DirAccess, Rights -AutoSize |
+        Out-String -Width 4096)
+    Write-ColoredTable -Text $tableText -Colorizer {
+        param($line)
+        if ($line -match '^PathDir\s+DirAccess')       { return 'Cyan' }
+        if ($line -match '^-+\s+-+')                   { return 'DarkGray' }
+        return 'Red'
+    }
+    Write-Status ("[+] {0} writable machine PATH directorie(s)" -f $pathRows.Count)
 }
-Write-Output ''
+Write-Blank
 
 # Scheduled tasks
 $taskRows = [System.Collections.Generic.List[object]]::new()
@@ -1036,42 +1154,164 @@ if ($scheduledTaskSupported) {
 }
 
 $taskOut = @($taskRows | Sort-Object TaskPath)
-Write-Output 'Scheduled tasks'
-Write-Output '---------------'
+Write-Header 'Scheduled tasks'
+Write-Rule   '---------------'
 if (-not $scheduledTaskSupported) {
-    Write-Output '[!] Scheduled task enumeration is not available via Get-ScheduledTask on this host.'
+    Write-Status '[!] Scheduled task enumeration is not available via Get-ScheduledTask on this host.'
 } elseif ($taskOut.Count -eq 0) {
-    Write-Output '[-] No writable/interesting scheduled-task actions were found.'
+    Write-Status '[-] No writable/interesting scheduled-task actions were found.'
 } else {
-    $taskOut |
-    Format-Table TaskPath, UserId, State, Execute, Arguments, ResolvedBinary, BinAccess, DirAccess, Findings -AutoSize |
-    Out-String -Width 4096
-    Write-Output ("[+] {0} interesting writable task action row(s)" -f $taskOut.Count)
+    $tableText = ($taskOut |
+        Format-Table TaskPath, UserId, State, Execute, Arguments, ResolvedBinary, BinAccess, DirAccess, Findings -AutoSize |
+        Out-String -Width 4096)
+    Write-ColoredTable -Text $tableText -Colorizer {
+        param($line)
+        if ($line -match '^TaskPath\s+UserId')         { return 'Cyan' }
+        if ($line -match '^-+\s+-+')                   { return 'DarkGray' }
+        if ($line -match $script:WritableAclRegex)     { return 'Red' }
+        return 'White'
+    }
+    Write-Status ("[+] {0} interesting writable task action row(s)" -f $taskOut.Count)
 }
-Write-Output ''
+Write-Blank
 
-Write-Output 'Manual verification'
-Write-Output '-------------------'
-Write-Output 'Services:'
-Write-Output '  sc.exe qc <serviceName>'
-Write-Output '  sc.exe sdshow <serviceName>'
-Write-Output '  reg query "HKLM\SYSTEM\CurrentControlSet\Services\<serviceName>" /v ImagePath'
-Write-Output '  icacls "<full-binary-path>"'
-Write-Output '  icacls "<parent-folder>"'
-Write-Output 'Installed software:'
-Write-Output '  dir "%ProgramFiles%"'
-Write-Output '  dir "%ProgramFiles(x86)%"'
-Write-Output '  reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" /s'
-Write-Output '  reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" /s'
-Write-Output '  reg query "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" /s'
-Write-Output 'Unquoted paths:'
-Write-Output '  icacls "<candidate-parent-dir>"'
-Write-Output 'DLL hijack checks:'
-Write-Output '  icacls "<binary-dir>"'
-Write-Output '  $env:Path'
-Write-Output 'Scheduled tasks:'
-Write-Output '  schtasks /query /tn "<task-name>" /xml'
-Write-Output '  schtasks /query /tn "<task-name>" /v /fo list'
-Write-Output 'Identity context:'
-Write-Output '  whoami'
-Write-Output '  whoami /groups'
+# Active network connections
+Write-Header 'Active network connections'
+Write-Rule   '--------------------------'
+
+$netRows = [System.Collections.Generic.List[object]]::new()
+
+$procCache = @{}
+foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
+    $procCache[[int]$p.Id] = $p.ProcessName
+}
+
+# Probe Get-NetTCPConnection — the cmdlet can exist but still throw at runtime
+# (e.g., CIM/WinRM broken, restricted token). Try once; on any failure, fall
+# back to netstat -ano which uses direct WinAPI and works in limited contexts.
+$tcpData = $null
+$udpData = $null
+try {
+    $tcpData = @(Get-NetTCPConnection -ErrorAction Stop 2>$null)
+} catch {
+    $tcpData = $null
+}
+if ($null -ne $tcpData) {
+    try {
+        $udpData = @(Get-NetUDPEndpoint -ErrorAction Stop 2>$null)
+    } catch {
+        $udpData = @()
+    }
+}
+
+if ($null -ne $tcpData) {
+    foreach ($c in $tcpData) {
+        $pidNum = [int]$c.OwningProcess
+        $procName = if ($procCache.ContainsKey($pidNum)) { $procCache[$pidNum] } else { '?' }
+        $netRows.Add([PSCustomObject]@{
+            Proto   = 'TCP'
+            Local   = ('{0}:{1}' -f $c.LocalAddress, $c.LocalPort)
+            Remote  = ('{0}:{1}' -f $c.RemoteAddress, $c.RemotePort)
+            State   = [string]$c.State
+            PID     = $pidNum
+            Process = $procName
+        })
+    }
+    foreach ($u in $udpData) {
+        $pidNum = [int]$u.OwningProcess
+        $procName = if ($procCache.ContainsKey($pidNum)) { $procCache[$pidNum] } else { '?' }
+        $netRows.Add([PSCustomObject]@{
+            Proto   = 'UDP'
+            Local   = ('{0}:{1}' -f $u.LocalAddress, $u.LocalPort)
+            Remote  = '*:*'
+            State   = 'Listen'
+            PID     = $pidNum
+            Process = $procName
+        })
+    }
+} else {
+    # Fallback: parse netstat -ano (no CIM dependency)
+    foreach ($line in @(netstat -ano 2>$null)) {
+        $t = $line.Trim()
+        if ($t -match '^TCP\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)$') {
+            $pidNum = [int]$Matches[4]
+            $procName = if ($procCache.ContainsKey($pidNum)) { $procCache[$pidNum] } else { '?' }
+            $netRows.Add([PSCustomObject]@{
+                Proto   = 'TCP'
+                Local   = $Matches[1]
+                Remote  = $Matches[2]
+                State   = $Matches[3]
+                PID     = $pidNum
+                Process = $procName
+            })
+        } elseif ($t -match '^UDP\s+(\S+)\s+(\S+)\s+(\d+)$') {
+            $pidNum = [int]$Matches[3]
+            $procName = if ($procCache.ContainsKey($pidNum)) { $procCache[$pidNum] } else { '?' }
+            $netRows.Add([PSCustomObject]@{
+                Proto   = 'UDP'
+                Local   = $Matches[1]
+                Remote  = '*:*'
+                State   = 'Listen'
+                PID     = $pidNum
+                Process = $procName
+            })
+        }
+    }
+}
+
+$netOut = @($netRows | Sort-Object Proto, State, Local)
+if ($netOut.Count -eq 0) {
+    Write-Status '[-] No active network connections were found.'
+} else {
+    $tableText = ($netOut |
+        Format-Table Proto, Local, Remote, State, PID, Process -AutoSize |
+        Out-String -Width 4096)
+    Write-ColoredTable -Text $tableText -Colorizer {
+        param($line)
+        if ($line -match '^Proto\s+Local')             { return 'Cyan' }
+        if ($line -match '^-+\s+-+')                   { return 'DarkGray' }
+        if ($line -match '\b(TIME_WAIT|CLOSE_WAIT)\b') { return 'DarkGray' }
+        if ($line -match '\b(Established|ESTABLISHED)\b') { return 'Green' }
+        if ($line -match '\b(Listen|LISTENING|Bound)\b') {
+            # Loopback-only listens are low-value
+            if ($line -match '(^|\s)(127\.0\.0\.1|\[::1\]):') { return 'DarkGray' }
+            return 'Yellow'
+        }
+        return 'White'
+    }
+    $listenCount = @($netOut | Where-Object { $_.State -match '^(Listen|LISTENING)$' }).Count
+    $estCount    = @($netOut | Where-Object { $_.State -match '^(Established|ESTABLISHED)$' }).Count
+    Write-Status ("[+] {0} endpoint(s); {1} listening, {2} established" -f $netOut.Count, $listenCount, $estCount)
+}
+Write-Blank
+
+Write-Header 'Manual verification'
+Write-Rule   '-------------------'
+Write-Info   'Services:'
+Write-Plain  '  sc.exe qc <serviceName>'
+Write-Plain  '  sc.exe sdshow <serviceName>'
+Write-Plain  '  reg query "HKLM\SYSTEM\CurrentControlSet\Services\<serviceName>" /v ImagePath'
+Write-Plain  '  icacls "<full-binary-path>"'
+Write-Plain  '  icacls "<parent-folder>"'
+Write-Info   'Installed software:'
+Write-Plain  '  dir "%ProgramFiles%"'
+Write-Plain  '  dir "%ProgramFiles(x86)%"'
+Write-Plain  '  reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" /s'
+Write-Plain  '  reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" /s'
+Write-Plain  '  reg query "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" /s'
+Write-Info   'Unquoted paths:'
+Write-Plain  '  icacls "<candidate-parent-dir>"'
+Write-Info   'DLL hijack checks:'
+Write-Plain  '  icacls "<binary-dir>"'
+Write-Plain  '  $env:Path'
+Write-Info   'Scheduled tasks:'
+Write-Plain  '  schtasks /query /tn "<task-name>" /xml'
+Write-Plain  '  schtasks /query /tn "<task-name>" /v /fo list'
+Write-Info   'Network connections:'
+Write-Plain  '  netstat -ano'
+Write-Plain  '  netstat -anob    # requires admin; resolves binaries'
+Write-Plain  '  Get-NetTCPConnection | Sort-Object LocalPort'
+Write-Plain  '  Get-NetUDPEndpoint  | Sort-Object LocalPort'
+Write-Info   'Identity context:'
+Write-Plain  '  whoami'
+Write-Plain  '  whoami /groups'
